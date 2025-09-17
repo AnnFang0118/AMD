@@ -6,6 +6,12 @@ import { createPortal } from 'react-dom'
 
 dayjs.locale('zh-tw')
 
+// ================= 可調整區（後端位址 / API 路徑） =================
+const BASE_URL =
+  (import.meta as any)?.env?.VITE_API_BASE_URL ||
+  `${window.location.protocol}//${window.location.hostname}:8000`
+const API_MONTH_SUMMARY = '/diary/summary' // GET /diary/summary?month=YYYY-MM → { "2025-09-01": { count:2, hasAudio:true, ... } }
+
 function buildMonthGrid(base: dayjs.Dayjs){
   const start = base.startOf('month').startOf('week')
   return Array.from({length:42}, (_,i)=>start.add(i,'day'))
@@ -13,33 +19,29 @@ function buildMonthGrid(base: dayjs.Dayjs){
 
 type Rect = { top: number; left: number; width: number; height: number }
 
+type DaySummary = {
+  count?: number
+  hasAudio?: boolean
+  hasImage?: boolean
+  hasVideo?: boolean
+}
+type MonthSummary = Record<string, DaySummary> // key: YYYY-MM-DD
+
 const TOUR_KEY = 'tour_calendar_v1'
 const MAX_TRIES = 10
 const forceTour = typeof window !== 'undefined' && /(?:\?|&)tour=1(?:&|$)/.test(window.location.search)
 
-function clamp(n: number, min: number, max: number) {
-  return Math.max(min, Math.min(max, n))
-}
+function clamp(n: number, min: number, max: number) { return Math.max(min, Math.min(max, n)) }
 function getRect(el: HTMLElement | null, pad = 10): Rect | null {
   if (!el) return null
   const r = el.getBoundingClientRect()
   if (r.width === 0 && r.height === 0) return null
-  return {
-    top: Math.max(8, r.top - pad),
-    left: Math.max(8, r.left - pad),
-    width: Math.min(window.innerWidth - 16, r.width + pad * 2),
-    height: Math.min(window.innerHeight - 16, r.height + pad * 2),
-  }
+  return { top: Math.max(8, r.top - pad), left: Math.max(8, r.left - pad), width: Math.min(window.innerWidth - 16, r.width + pad * 2), height: Math.min(window.innerHeight - 16, r.height + pad * 2) }
 }
 // 取得「手機畫面」容器邊界（優先 .screen，其次 .phone）
 function getHostRect(anchor?: HTMLElement | null): DOMRect {
-  const fromClosest =
-    (anchor?.closest('.screen') as HTMLElement | null) ||
-    (anchor?.closest('.phone') as HTMLElement | null)
-  const el =
-    fromClosest ||
-    (document.querySelector('.phone .screen') as HTMLElement | null) ||
-    (document.querySelector('.phone') as HTMLElement | null)
+  const fromClosest = (anchor?.closest('.screen') as HTMLElement | null) || (anchor?.closest('.phone') as HTMLElement | null)
+  const el = fromClosest || (document.querySelector('.phone .screen') as HTMLElement | null) || (document.querySelector('.phone') as HTMLElement | null)
   return (el || document.body).getBoundingClientRect()
 }
 
@@ -47,6 +49,59 @@ export default function CalendarPage(){
   const [focus,setFocus]=useState(dayjs())
   const cells = useMemo(()=>buildMonthGrid(focus),[focus])
   const nav = useNavigate()
+
+  // ====== 後端：月份摘要（不改你原本畫面） ======
+  const [summary, setSummary] = useState<MonthSummary>({})
+  const [loading, setLoading] = useState(false)
+  const [loadErr, setLoadErr] = useState<string | null>(null)
+  const cacheRef = useRef<Record<string, MonthSummary>>({})
+
+  function getAuthHeader(): Record<string, string> {
+    try {
+      const t = localStorage.getItem('token')
+      return t ? { Authorization: `Bearer ${t}` } : {}
+    } catch {
+      return {}
+    }
+  }
+
+  async function fetchMonthSummary(month: string){
+    // 有快取就直接用，畫面維持原樣
+    if (cacheRef.current[month]){ setSummary(cacheRef.current[month]); return }
+    setLoading(true); setLoadErr(null)
+    const ctrl = new AbortController(); const to = setTimeout(()=>ctrl.abort(), 10000)
+    try{
+      const res = await fetch(`${BASE_URL}${API_MONTH_SUMMARY}?month=${encodeURIComponent(month)}`, {
+        headers: { Accept: 'application/json', ...getAuthHeader() } as HeadersInit,
+        signal: ctrl.signal,
+      })
+      clearTimeout(to)
+      let data: any = null; try{ data = await res.json() } catch{}
+      if (!res.ok) throw new Error(data?.detail || data?.message || `讀取失敗（HTTP ${res.status}）`)
+      const map: MonthSummary = {}
+      if (data && typeof data === 'object'){
+        for (const [k, v] of Object.entries<any>(data)){
+          if (/^\d{4}-\d{2}-\d{2}$/.test(k)) {
+            map[k] = {
+              count: typeof v?.count === 'number' ? v.count : undefined,
+              hasAudio: !!v?.hasAudio,
+              hasImage: !!v?.hasImage,
+              hasVideo: !!v?.hasVideo,
+            }
+          }
+        }
+      }
+      cacheRef.current[month] = map
+      setSummary(map)
+    }catch(e:any){
+      setLoadErr(e?.name==='AbortError' ? '連線逾時' : (e?.message || '讀取失敗'))
+      setSummary({})
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  useEffect(() => { void fetchMonthSummary(focus.format('YYYY-MM')) }, [focus.year(), focus.month()])
 
   // ====== 聚光燈導覽 refs/states ======
   const headerRef = useRef<HTMLDivElement | null>(null)     // 頁面抬頭（日期/星期）
@@ -177,18 +232,33 @@ export default function CalendarPage(){
           <div>{focus.format('YYYY年M月')}</div>
           <button onClick={()=>setFocus(focus.add(1,'month'))}>›</button>
         </div>
+
+        {/* 後端錯誤（中文提示、可重試） */}
+        {loadErr && (
+          <div className="inline-alert" role="alert" style={{marginTop:8}}>
+            <div className="inline-alert-text">{loadErr}</div>
+            <button
+              className="inline-alert-close"
+              aria-label="重試"
+              onClick={()=>fetchMonthSummary(focus.format('YYYY-MM'))}
+            >↻</button>
+          </div>
+        )}
+
         <div className="cal-week">
           {'週日 週一 週二 週三 週四 週五 週六'.split(' ').map(w=><div key={w} style={{textAlign:'center'}}>{w}</div>)}
         </div>
-        <div ref={calGridRef} className="cal-grid">
+        <div ref={calGridRef} className={`cal-grid ${loading ? 'loading' : ''}`} aria-busy={loading}>
           {cells.map(d=>{
             const inMonth = d.month()===focus.month()
             const isToday = d.isSame(dayjs(), 'day')
+            const key = d.format('YYYY-MM-DD')
+            const hasAny = !!summary[key] && (summary[key].count || summary[key].hasAudio || summary[key].hasImage || summary[key].hasVideo)
             return (
               <div
-                key={d.format('YYYY-MM-DD')}
-                className={`cal-cell ${inMonth?'':'out'} ${isToday?'today':''}`}
-                onClick={() => nav(`/diary1/${d.format('YYYY-MM-DD')}`)}
+                key={key}
+                className={`cal-cell ${inMonth?'':'out'} ${isToday?'today':''} ${hasAny?'has':''}`}
+                onClick={() => nav(`/diary1/${key}`)}
                 title={`查看 ${d.format('YYYY/MM/DD')} 的日記`}
               >
                 {d.date()}

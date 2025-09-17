@@ -1,5 +1,5 @@
 // src/pages/ChildBoundInfo.tsx
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState, useCallback } from 'react'
 
 type LinkRequest = {
   id: string
@@ -13,12 +13,12 @@ type LinkRequest = {
 
 type Binding = { parentName: string; parentEmail?: string }
 
-const REQ_KEY = 'link-requests'              // 與家長端共用的佇列 key
-const BINDING_KEY = 'binding'                // 子女端本機綁定資訊
+const REQ_KEY = 'link-requests'   // 與家長端共用的佇列 key（本機模擬）
+const BINDING_KEY = 'binding'     // 子女端本機綁定資訊
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
 
 function loadRequests(): LinkRequest[] {
-  try { return JSON.parse(localStorage.getItem(REQ_KEY) || '[]') } catch { return [] }
+  try { return JSON.parse(localStorage.getItem(REQ_KEY) || '[]') as LinkRequest[] } catch { return [] }
 }
 function saveRequests(reqs: LinkRequest[]) {
   localStorage.setItem(REQ_KEY, JSON.stringify(reqs))
@@ -68,26 +68,26 @@ export default function ChildBoundInfo(){
   // Toast
   const [toast, setToast] = useState<string | null>(null)
   const toastTimerRef = useRef<number | null>(null)
-  function showToast(msg: string){
+  const showToast = useCallback((msg: string) => {
     setToast(msg)
     if (toastTimerRef.current) window.clearTimeout(toastTimerRef.current)
     toastTimerRef.current = window.setTimeout(()=>setToast(null), 1800)
-  }
+  }, [])
 
-  // 初始載入：抓我的請求
-  useEffect(() => {
-    refreshMyRequests()
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [currentChild?.email])
-
-  function refreshMyRequests(){
+  // 抓我的請求（包在 useCallback，供多處呼叫）
+  const refreshMyRequests = useCallback(async () => {
     const email = (currentChild?.email || '').toLowerCase()
     if (!email) return
     const list = loadRequests()
       .filter(r => r.childEmail === email)
       .sort((a,b)=>b.createdAt - a.createdAt)
     setMyReqs(list)
-  }
+  }, [currentChild?.email])
+
+  // 初始載入：抓我的請求
+  useEffect(() => {
+    void refreshMyRequests()
+  }, [refreshMyRequests])
 
   // 送出綁定請求（由子女端發）
   async function onSubmit(e: React.FormEvent){
@@ -109,7 +109,7 @@ export default function ChildBoundInfo(){
       // 更新畫面
       setParentEmail('')
       setNote('')
-      refreshMyRequests()
+      await refreshMyRequests()
       showToast('已送出綁定請求')
 
       // 方便分享：複製家長審核連結
@@ -124,22 +124,30 @@ export default function ChildBoundInfo(){
   }
 
   // 同步綁定：找到「已同意」的請求，把家長 Email 寫進子女本機 binding
-  function syncBinding(){
+  const syncBinding = useCallback(() => {
     const accepted = myReqs.find(r => r.status === 'accepted')
     if (!accepted) { showToast('尚未有已同意的請求'); return }
-    const b: Binding = {
-      parentName: '已綁定家長',
-      parentEmail: accepted.parentEmail,
-    }
+    const b: Binding = { parentName: '已綁定家長', parentEmail: accepted.parentEmail }
     localStorage.setItem(BINDING_KEY, JSON.stringify(b))
     setBinding(b)
     showToast('綁定已同步')
-  }
+  }, [myReqs, showToast])
 
-  function unbind(){
+  const unbind = useCallback(() => {
     localStorage.removeItem(BINDING_KEY)
     setBinding(null)
     showToast('已解除綁定（僅清除此裝置）')
+  }, [showToast])
+
+  // === 重要：onClick 型別修正（包一層 MouseEventHandler） ===
+  const handleRefreshClick: React.MouseEventHandler<HTMLButtonElement> = () => {
+    void refreshMyRequests()
+  }
+  const handleSyncBindingClick: React.MouseEventHandler<HTMLButtonElement> = () => {
+    syncBinding()
+  }
+  const handleUnbindClick: React.MouseEventHandler<HTMLButtonElement> = () => {
+    unbind()
   }
 
   return (
@@ -154,8 +162,8 @@ export default function ChildBoundInfo(){
               {binding.parentEmail ? `（${binding.parentEmail}）` : ''}
             </div>
             <div style={{marginTop:10, display:'flex', gap:8}}>
-              <button onClick={unbind} style={{border:'1px solid #ddd', background:'#fff', borderRadius:10, padding:'6px 10px', cursor:'pointer'}}>解除綁定</button>
-              <button onClick={refreshMyRequests} style={{border:'1px solid #ddd', background:'#fff', borderRadius:10, padding:'6px 10px', cursor:'pointer'}}>刷新請求狀態</button>
+              <button onClick={handleUnbindClick} style={{border:'1px solid #ddd', background:'#fff', borderRadius:10, padding:'6px 10px', cursor:'pointer'}}>解除綁定</button>
+              <button onClick={handleRefreshClick} style={{border:'1px solid #ddd', background:'#fff', borderRadius:10, padding:'6px 10px', cursor:'pointer'}}>刷新請求狀態</button>
             </div>
           </>
         ) : (
@@ -191,7 +199,7 @@ export default function ChildBoundInfo(){
           </button>
           <div className="meta">
             送出後可將「同意連結」貼給家長：系統會自動複製
-            <code style={{margin: '0 4px'}}> /link-child?rid=… </code>
+            <code style={{margin: '0 4px'}}>/link-child?rid=…</code>
             的審核連結。
           </div>
         </form>
@@ -201,8 +209,8 @@ export default function ChildBoundInfo(){
       <div className="card" style={{padding:0}}>
         <div style={{padding:'12px 16px', borderBottom:'1px solid #eee', fontWeight:700}}>
           我的綁定請求
-          <button onClick={refreshMyRequests} style={{marginLeft:8, border:'1px solid #eee', background:'#fff', borderRadius:8, padding:'2px 8px', fontSize:12, cursor:'pointer'}}>刷新</button>
-          <button onClick={syncBinding} style={{marginLeft:8, border:'1px solid #eee', background:'#fff', borderRadius:8, padding:'2px 8px', fontSize:12, cursor:'pointer'}}>同步綁定</button>
+          <button onClick={handleRefreshClick} style={{marginLeft:8, border:'1px solid #eee', background:'#fff', borderRadius:8, padding:'2px 8px', fontSize:12, cursor:'pointer'}}>刷新</button>
+          <button onClick={handleSyncBindingClick} style={{marginLeft:8, border:'1px solid #eee', background:'#fff', borderRadius:8, padding:'2px 8px', fontSize:12, cursor:'pointer'}}>同步綁定</button>
         </div>
         {myReqs.length === 0 ? (
           <div style={{padding:16, color:'#666'}}>尚未送出任何請求。</div>
@@ -219,7 +227,6 @@ export default function ChildBoundInfo(){
                   </div>
                 </div>
                 <StatusBadge status={r.status} />
-                
               </div>
             ))}
           </div>
@@ -254,5 +261,3 @@ function StatusBadge({ status }: { status: LinkRequest['status'] }){
     </span>
   )
 }
-
-

@@ -1,6 +1,20 @@
 import { useEffect, useRef, useState } from 'react'
 import { useNavigate, Link } from 'react-router-dom'
-import TermsModal from './TermsModal' // ✅ 新增：使用條款彈窗
+import TermsModal from './TermsModal'
+
+// =============== 可調整區：後端位址與 API Path ==================
+const BASE_URL = (import.meta as any)?.env?.VITE_API_BASE_URL || `${window.location.protocol}//${window.location.hostname}:8000`
+const API_REGISTER = '/enroll/register'
+
+// 後端回傳格式（可依你們實際回傳調整）
+type RegisterResponse = {
+  success?: boolean
+  userId?: string
+  email?: string
+  message?: string
+  detail?: string | Array<{ loc?: (string | number)[]; msg: string; type?: string }>
+  errors?: Record<string, string[]>
+}
 
 type Role = 'user' | 'child'
 type FieldKey = 'name' | 'email' | 'pwd' | 'pwd2' | 'agree'
@@ -91,210 +105,188 @@ export default function Register() {
     }
   }, [topErrors.length])
 
+  // ========= 後端錯誤解析（FastAPI / Express 常見格式皆可） =========
+  function applyServerErrors(data: RegisterResponse | null, status: number){
+    const fe: Partial<Record<FieldKey, string>> = {}
+    const te: string[] = []
+
+    if (status === 409) {
+      fe.email = '此 Email 已被註冊'
+      te.push('此 Email 已被註冊')
+    }
+
+    if (data?.errors && typeof data.errors === 'object') {
+      for (const [k, arr] of Object.entries(data.errors)){
+        const msg = Array.isArray(arr) ? arr[0] : String(arr)
+        if (k.includes('email')) { fe.email = msg; te.push(msg) }
+        else if (k.includes('password')) { fe.pwd = msg; te.push(msg) }
+        else if (k.includes('name')) { fe.name = msg; te.push(msg) }
+        else { te.push(msg) }
+      }
+    }
+
+    if (Array.isArray(data?.detail)) {
+      for (const d of data!.detail as RegisterResponse['detail'] as any[]){
+        const loc = (d?.loc || []) as (string | number)[]
+        const msg = d?.msg || '欄位不正確'
+        const key = String(loc[loc.length - 1] || '').toLowerCase()
+        if (key.includes('email')) { fe.email = msg; te.push(msg) }
+        else if (key.includes('password')) { fe.pwd = msg; te.push(msg) }
+        else if (key.includes('name')) { fe.name = msg; te.push(msg) }
+        else { te.push(msg) }
+      }
+    }
+
+    if (typeof data?.detail === 'string') te.push(data.detail)
+    if (data?.message) te.push(data.message)
+
+    if (te.length === 0 && status >= 400) te.push(`註冊失敗（HTTP ${status}）`)
+
+    if (Object.keys(fe).length) setFieldErrs(prev => ({ ...prev, ...fe }))
+    if (te.length) setTopErrors(prev => (prev.length ? prev : te))
+  }
+
   async function onSubmit(e: React.FormEvent) {
     e.preventDefault()
     if (!validateAll()) return
+
     try {
       setLoading(true)
-      // TODO: 換成你的後端 API
-      await new Promise(r => setTimeout(r, 600))
+
+      const payload = { role, name: name.trim(), email: email.trim(), password: pwd, agree }
+
+      // 逾時控制
+      const ctrl = new AbortController()
+      const to = setTimeout(() => ctrl.abort(), 10000)
+
+      const res = await fetch(`${BASE_URL}${API_REGISTER}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+        signal: ctrl.signal,
+      })
+
+      clearTimeout(to)
+
+      let data: RegisterResponse | null = null
+      try { data = await res.json() } catch { /* 可能不是 JSON/空 body */ }
+
+      if (!res.ok) {
+        applyServerErrors(data, res.status)
+        return
+      }
+
+      // 成功 → 導向登入頁並帶 Email
       nav('/login', { replace: true, state: { justRegistered: true, email } })
+    } catch (e: any) {
+      if (e?.name === 'AbortError') {
+        setTopErrors(prev => (prev.length ? prev : ['連線逾時，請稍後重試']))
+      } else {
+        setTopErrors(prev => (prev.length ? prev : [e?.message || '註冊失敗，請稍後再試']))
+      }
     } finally {
       setLoading(false)
     }
   }
 
   const themeClass = role === 'user' ? 'theme-user' : 'theme-child'
-  const hideInlineErrors = Object.keys(fieldErrs).length > 0
+  const hideInlineErrors = Object.keys(fieldErrs).length > 0 // 有錯誤時只顯示頂部 alert，不顯示欄位內文案
 
   // ===== 角色導覽：內容設定 =====
   const introContent = role === 'user'
-    ? {
-        title: '使用者端是做什麼的？',
-        bullets: [
-          '用語音一鍵記錄每天的生活與心情',
-          '自動轉文字、支援台語/國語混講',
-          '可查看自己的日記、情緒趨勢與標籤'
-        ]
-      }
-    : {
-        title: '子女端是做什麼的？',
-        bullets: [
-          '綁定家中長者帳號後可查看其日記摘要',
-          '即時掌握情緒趨勢與異常提醒',
-          '促進跨城市/跨國的日常關懷'
-        ]
-      }
+    ? { title: '使用者端是做什麼的？', bullets: ['用語音一鍵記錄每天的生活與心情','自動轉文字、支援台語/國語混講','可查看自己的日記、情緒趨勢與標籤'] }
+    : { title: '子女端是做什麼的？', bullets: ['綁定家中長者帳號後可查看其日記摘要','即時掌握情緒趨勢與異常提醒','促進跨城市/跨國的日常關懷'] }
 
-  const INTRO_KEY = (r: Role) => `intro_shown_${r}` // ✅ 修正模板字串
+  const INTRO_KEY = (r: Role) => `intro_shown_${r}`
 
   // 初次載入 & 每次切換角色：若尚未看過該角色導覽，顯示 Modal
   useEffect(() => {
     try {
       const seen = localStorage.getItem(INTRO_KEY(role))
-      if (!seen) {
-        setDontShowAgain(false)
-        setShowIntro(true)
-      }
-    } catch {
-      // 若無法使用 localStorage，仍可顯示一次
-      setDontShowAgain(false)
-      setShowIntro(true)
-    }
+      if (!seen) { setDontShowAgain(false); setShowIntro(true) }
+    } catch { setDontShowAgain(false); setShowIntro(true) }
   }, [role])
 
   // Modal 打開時把焦點移到「我知道了」按鈕（可近用）
-  useEffect(() => {
-    if (showIntro && introOkBtnRef.current) {
-      introOkBtnRef.current.focus()
-    }
-  }, [showIntro])
+  useEffect(() => { if (showIntro && introOkBtnRef.current) introOkBtnRef.current.focus() }, [showIntro])
 
   const closeIntro = () => {
-    try {
-      if (dontShowAgain) {
-        localStorage.setItem(INTRO_KEY(role), '1')
-      }
-    } catch { /* 忽略 */ }
+    try { if (dontShowAgain) localStorage.setItem(INTRO_KEY(role), '1') } catch {}
     setShowIntro(false)
   }
 
   return (
-    <div className={`phone-wrap ${themeClass}`}> {/* ✅ 修正模板字串 */}
+    <div className={`phone-wrap ${themeClass}`}>
       <div className="phone">
         <div className="screen">
-          <div className="appbar"
-               style={{ background:'var(--login-appbar-bg)', color:'var(--login-appbar-fg)' }}>
+          <div className="appbar" style={{ background:'var(--login-appbar-bg)', color:'var(--login-appbar-fg)' }}>
             註冊
             {/* 右上角小問號：隨時查看說明 */}
-            <button
-              className="appbar-help"
-              aria-label="角色說明"
-              onClick={() => { setDontShowAgain(false); setShowIntro(true) }}
-              title="角色說明"
-            >
-              ?
-            </button>
+            <button className="appbar-help" aria-label="角色說明" onClick={() => { setDontShowAgain(false); setShowIntro(true) }} title="角色說明">?</button>
           </div>
 
           <div className="content login-layout">
             <div className="login-card" style={{ borderColor:'var(--login-card-border)' }}>
               <div className="login-brand">
-                <div className="title" style={{ color:'var(--login-title)', textAlign:'center', fontSize:22, fontWeight:700 }}>
-                  建立帳號
-                </div>
+                <div className="title" style={{ color:'var(--login-title)', textAlign:'center', fontSize:22, fontWeight:700 }}>建立帳號</div>
               </div>
 
               {/* 角色切換 */}
               <div className="role-tabs">
-                <button
-                  type="button"
-                  className={`role-tab ${role==='user'?'active':''}`} // ✅ 修正模板字串
-                  onClick={()=>setRole('user')}
-                >使用者</button>
-                <button
-                  type="button"
-                  className={`role-tab ${role==='child'?'active':''}`} // ✅ 修正模板字串
-                  onClick={()=>setRole('child')}
-                >子女端</button>
+                <button type="button" className={`role-tab ${role==='user'?'active':''}`} onClick={()=>setRole('user')}>使用者</button>
+                <button type="button" className={`role-tab ${role==='child'?'active':''}`} onClick={()=>setRole('child')}>子女端</button>
               </div>
 
               {/* 表單內第一個欄位上方的 Alert 條（只顯示第一條） */}
               {topErrors.length > 0 && !dismissed && (
-                <div
-                  ref={alertRef}
-                  className="inline-alert"
-                  tabIndex={-1}
-                  aria-live="assertive"
-                  aria-atomic="true"
-                >
+                <div ref={alertRef} className="inline-alert" tabIndex={-1} aria-live="assertive" aria-atomic="true">
                   <div className="inline-alert-text">{topErrors[0]}</div>
-                  <button
-                    className="inline-alert-close"
-                    onClick={() => setDismissed(true)}
-                    aria-label="關閉"
-                  >×</button>
+                  <button className="inline-alert-close" onClick={() => setDismissed(true)} aria-label="關閉">×</button>
                 </div>
               )}
 
               <form onSubmit={onSubmit} className="login-form" noValidate>
                 <label className="field">
                   <span className="label">使用者名稱</span>
-                  <input
-                    value={name}
-                    onChange={e=>setName(e.target.value)}
-                    aria-invalid={!!fieldErrs.name}
-                  />
+                  <input value={name} onChange={e=>setName(e.target.value)} aria-invalid={!!fieldErrs.name} />
                   {!hideInlineErrors && fieldErrs.name && <div className="error">{fieldErrs.name}</div>}
                 </label>
 
                 <label className="field">
                   <span className="label">Email</span>
-                  <input
-                    value={email}
-                    onChange={e=>setEmail(e.target.value)}
-                    inputMode="email"
-                    aria-invalid={!!fieldErrs.email}
-                  />
+                  <input value={email} onChange={e=>setEmail(e.target.value)} inputMode="email" autoComplete="email" aria-invalid={!!fieldErrs.email} />
                   {!hideInlineErrors && fieldErrs.email && <div className="error">{fieldErrs.email}</div>}
                 </label>
 
                 <label className="field">
                   <span className="label">密碼</span>
-                  <input
-                    type="password"
-                    value={pwd}
-                    onChange={e=>setPwd(e.target.value)}
-                    aria-invalid={!!fieldErrs.pwd}
-                  />
+                  <input type="password" value={pwd} onChange={e=>setPwd(e.target.value)} autoComplete="new-password" aria-invalid={!!fieldErrs.pwd} />
                   {!hideInlineErrors && fieldErrs.pwd && <div className="error">{fieldErrs.pwd}</div>}
                 </label>
 
                 <label className="field">
                   <span className="label">確認密碼</span>
-                  <input
-                    type="password"
-                    value={pwd2}
-                    onChange={e=>setPwd2(e.target.value)}
-                    aria-invalid={!!fieldErrs.pwd2}
-                  />
+                  <input type="password" value={pwd2} onChange={e=>setPwd2(e.target.value)} autoComplete="new-password" aria-invalid={!!fieldErrs.pwd2} />
                   {!hideInlineErrors && fieldErrs.pwd2 && <div className="error">{fieldErrs.pwd2}</div>}
                 </label>
 
                 {/* ✅ 勾選 + 按鈕開啟「使用條款」彈窗；按「同意並關閉」會自動勾選 */}
                 <label className="field" style={{ flexDirection:'row', alignItems:'center', gap:10 }}>
-                  <input
-                    type="checkbox"
-                    checked={agree}
-                    onChange={e=>setAgree(e.target.checked)}
-                    aria-invalid={!!fieldErrs.agree}
-                  />
+                  <input type="checkbox" checked={agree} onChange={e=>setAgree(e.target.checked)} aria-invalid={!!fieldErrs.agree} />
                   <span className="meta">
                     我已閱讀並同意
-                    <button
-                      type="button"
-                      onClick={() => setShowTerms(true)}
-                      style={{
-                        background:'none', border:0, padding:0, marginLeft:4,
-                        color:'var(--login-btn-bg)', textDecoration:'underline', cursor:'pointer'
-                      }}
-                    >
-                      使用條款
-                    </button>
+                    <button type="button" onClick={() => setShowTerms(true)} style={{ background:'none', border:0, padding:0, marginLeft:4, color:'var(--login-btn-bg)', textDecoration:'underline', cursor:'pointer' }}>使用條款</button>
                     與隱私政策
                   </span>
                 </label>
                 {!hideInlineErrors && fieldErrs.agree && <div className="error">{fieldErrs.agree}</div>}
 
-                <button className="btn-primary" disabled={loading}
-                        style={{ background:'var(--login-btn-bg)' }}>
+                <button className="btn-primary" disabled={loading} style={{ background:'var(--login-btn-bg)' }}>
                   {loading ? '建立中…' : '建立帳號'}
                 </button>
               </form>
 
-              <div className="help">
-                已有帳號？<Link to="/login">前往登入</Link>
-              </div>
+              <div className="help">已有帳號？<Link to="/login">前往登入</Link></div>
             </div>
           </div>
         </div>
@@ -309,26 +301,14 @@ export default function Register() {
               <button className="modal-close" aria-label="關閉" onClick={closeIntro}>×</button>
             </div>
             <div className="modal-body">
-              <ul className="modal-list">
-                {introContent.bullets.map((b, i) => (<li key={i}>{b}</li>))}
-              </ul>
+              <ul className="modal-list">{introContent.bullets.map((b, i) => (<li key={i}>{b}</li>))}</ul>
               <label className="modal-check">
-                <input
-                  type="checkbox"
-                  checked={dontShowAgain}
-                  onChange={e => setDontShowAgain(e.target.checked)}
-                />
+                <input type="checkbox" checked={dontShowAgain} onChange={e => setDontShowAgain(e.target.checked)} />
                 <span>下次不再顯示</span>
               </label>
             </div>
             <div className="modal-footer">
-              <button
-                ref={introOkBtnRef}
-                className="btn-primary"
-                onClick={closeIntro}
-              >
-                我知道了
-              </button>
+              <button ref={introOkBtnRef} className="btn-primary" onClick={closeIntro}>我知道了</button>
             </div>
           </div>
         </div>
@@ -338,10 +318,7 @@ export default function Register() {
       <TermsModal
         open={showTerms}
         onClose={() => setShowTerms(false)}
-        onAgree={() => {
-          setAgree(true)        // ✅ 一鍵同意
-          setShowTerms(false)
-        }}
+        onAgree={() => { setAgree(true); setShowTerms(false) }}
       />
     </div>
   )

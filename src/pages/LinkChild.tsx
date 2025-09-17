@@ -18,19 +18,55 @@ type LinkedChild = {
   linkedAt: number
 }
 
-const REQ_KEY = 'link-requests' // 伺服器佇列（以 localStorage 模擬）
+// ===== 後端位址 & headers =====
+const BASE_URL =
+  (import.meta as any)?.env?.VITE_API_BASE_URL ||
+  `${window.location.protocol}//${window.location.hostname}:8000`
+
+function getAuthHeader(): Record<string, string> {
+  try {
+    const t = localStorage.getItem('token')
+    return t ? { Authorization: `Bearer ${t}` } : {}
+  } catch {
+    return {}
+  }
+}
+
+// 依你後端實際路徑調整（以下為範例）
+const API = {
+  listRequests: (parentEmail: string) =>
+    `${BASE_URL}/links/requests?status=pending&parent=${encodeURIComponent(parentEmail)}`,
+  approve: (id: string) => `${BASE_URL}/links/requests/${encodeURIComponent(id)}/approve`,
+  reject: (id: string) => `${BASE_URL}/links/requests/${encodeURIComponent(id)}/reject`,
+  listLinked: (parentEmail: string) =>
+    `${BASE_URL}/links/children?parent=${encodeURIComponent(parentEmail)}`,
+}
+
+// ===== localStorage 模擬（後備） =====
+const REQ_KEY = 'link-requests'
 const LIST_KEY = (parentEmail: string) => `linked-children:${parentEmail}`
 
-// ===== 模擬「子女端送出綁定請求」的函式 =====
-// 真實情境應由子女端呼叫後端 API 建立請求。
-// 你也可以把這段搬去子女端頁面，這裡只是方便你測試。
+function loadRequestsLS(): LinkRequest[] {
+  try { return JSON.parse(localStorage.getItem(REQ_KEY) || '[]') } catch { return [] }
+}
+function saveRequestsLS(reqs: LinkRequest[]) {
+  localStorage.setItem(REQ_KEY, JSON.stringify(reqs))
+}
+function loadLinkedLS(parentEmail: string): LinkedChild[] {
+  try { return JSON.parse(localStorage.getItem(LIST_KEY(parentEmail)) || '[]') } catch { return [] }
+}
+function saveLinkedLS(parentEmail: string, list: LinkedChild[]) {
+  localStorage.setItem(LIST_KEY(parentEmail), JSON.stringify(list))
+}
+
+// （開發用）快速造一筆 pending
 export function submitLinkRequestMock(params: {
   parentEmail: string
   childEmail: string
   childName?: string
   note?: string
 }) {
-  const list: LinkRequest[] = JSON.parse(localStorage.getItem(REQ_KEY) || '[]')
+  const list: LinkRequest[] = loadRequestsLS()
   const req: LinkRequest = {
     id: crypto.randomUUID(),
     parentEmail: params.parentEmail.trim().toLowerCase(),
@@ -41,25 +77,36 @@ export function submitLinkRequestMock(params: {
     status: 'pending',
   }
   list.push(req)
-  localStorage.setItem(REQ_KEY, JSON.stringify(list))
+  saveRequestsLS(list)
   return req
 }
 
-function loadRequests(): LinkRequest[] {
-  try { return JSON.parse(localStorage.getItem(REQ_KEY) || '[]') } catch { return [] }
+// ====== 後端呼叫（若失敗就丟錯，外層會 fallback 到 localStorage） ======
+async function getJSON(url: string, signal?: AbortSignal) {
+  const res = await fetch(url, {
+    headers: { Accept: 'application/json', ...getAuthHeader() } as HeadersInit,
+    signal,
+  })
+  let data: any = null
+  try { data = await res.json() } catch {}
+  if (!res.ok) throw new Error(data?.detail || data?.message || `HTTP ${res.status}`)
+  return data
 }
-function saveRequests(reqs: LinkRequest[]) {
-  localStorage.setItem(REQ_KEY, JSON.stringify(reqs))
-}
-function loadLinked(parentEmail: string): LinkedChild[] {
-  try { return JSON.parse(localStorage.getItem(LIST_KEY(parentEmail)) || '[]') } catch { return [] }
-}
-function saveLinked(parentEmail: string, list: LinkedChild[]) {
-  localStorage.setItem(LIST_KEY(parentEmail), JSON.stringify(list))
+async function postJSON(url: string, body?: any, signal?: AbortSignal) {
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json', ...getAuthHeader() } as HeadersInit,
+    body: body ? JSON.stringify(body) : undefined,
+    signal,
+  })
+  let data: any = null
+  try { data = await res.json() } catch {}
+  if (!res.ok) throw new Error(data?.detail || data?.message || `HTTP ${res.status}`)
+  return data
 }
 
 export default function LinkChild(){
-  // 假登入使用者（你登入時已把 user 存在 localStorage）
+  // 假設登入時已把 user 存在 localStorage
   const currentUser = useMemo(() => {
     try { return JSON.parse(localStorage.getItem('user') || 'null') as { email: string; name?: string } | null } catch { return null }
   }, [])
@@ -70,28 +117,8 @@ export default function LinkChild(){
   const [picked, setPicked] = useState<LinkRequest | null>(null)
   const [toast, setToast] = useState<string | null>(null)
   const toastTimerRef = useRef<number | null>(null)
-
-  // 初始載入：拉 pending 佇列 + 已綁定清單
-  useEffect(() => {
-    if (!currentUser?.email) return
-    const email = currentUser.email.toLowerCase()
-    const all = loadRequests()
-    setRequests(all.filter(r => r.parentEmail === email && r.status === 'pending')
-                  .sort((a,b)=>b.createdAt - a.createdAt))
-    setLinked(loadLinked(email).sort((a,b)=>b.linkedAt - a.linkedAt))
-  }, [currentUser?.email])
-
-  // 支援 ?rid=xxx 直接彈出審核視窗
-  useEffect(() => {
-    if (!currentUser?.email) return
-    const rid = searchParams.get('rid')
-    if (!rid) return
-    const all = loadRequests()
-    const target = all.find(r => r.id === rid && r.parentEmail === currentUser.email.toLowerCase())
-    if (target && target.status === 'pending') {
-      setPicked(target)
-    }
-  }, [searchParams, currentUser?.email])
+  const [loading, setLoading] = useState(false)
+  const [err, setErr] = useState<string | null>(null)
 
   function showToast(msg: string){
     setToast(msg)
@@ -99,39 +126,94 @@ export default function LinkChild(){
     toastTimerRef.current = window.setTimeout(()=>setToast(null), 1800)
   }
 
-  function approve(req: LinkRequest){
+  // 拉 pending + 已綁定（先試後端，失敗改用 localStorage）
+  async function refreshAll() {
+    if (!currentUser?.email) return
+    setLoading(true); setErr(null)
+    const email = currentUser.email.toLowerCase()
+    const ac = new AbortController(); const to = setTimeout(()=>ac.abort(), 10000)
+    try {
+      const [reqs, kids] = await Promise.all([
+        getJSON(API.listRequests(email), ac.signal),
+        getJSON(API.listLinked(email), ac.signal),
+      ])
+      // 依你的 API 格式調整以下 mapping
+      const normReqs: LinkRequest[] = Array.isArray(reqs) ? reqs : (reqs?.items || [])
+      const normKids: LinkedChild[] = Array.isArray(kids) ? kids : (kids?.items || [])
+      setRequests(normReqs.filter(r => r.status === 'pending').sort((a,b)=>b.createdAt - a.createdAt))
+      setLinked(normKids.sort((a,b)=>b.linkedAt - a.linkedAt))
+    } catch (e:any) {
+      // 後備：localStorage
+      const lsReqs = loadRequestsLS()
+        .filter(r => r.parentEmail === email && r.status === 'pending')
+        .sort((a,b)=>b.createdAt - a.createdAt)
+      const lsLinked = loadLinkedLS(email).sort((a,b)=>b.linkedAt - a.linkedAt)
+      setRequests(lsReqs)
+      setLinked(lsLinked)
+      setErr(e?.message || '連線失敗，使用本機資料')
+    } finally {
+      clearTimeout(to)
+      setLoading(false)
+    }
+  }
+
+  useEffect(() => { void refreshAll() }, [currentUser?.email])
+
+  // 支援 ?rid=xxx 直接開審核視窗（同樣先查後端，後備 localStorage）
+  useEffect(() => {
+    const rid = searchParams.get('rid')
+    if (!rid || !currentUser?.email) return
+    const email = currentUser.email.toLowerCase()
+    // 從現有 requests 找；若空再去 localStorage 找
+    const inState = requests.find(r => r.id === rid)
+    if (inState) { if (inState.status === 'pending') setPicked(inState); return }
+    const all = loadRequestsLS()
+    const target = all.find(r => r.id === rid && r.parentEmail === email)
+    if (target && target.status === 'pending') setPicked(target)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchParams, currentUser?.email, requests.length])
+
+  async function approve(req: LinkRequest){
     const email = currentUser!.email.toLowerCase()
-    // 1) 更新請求狀態
-    const all = loadRequests()
-    const idx = all.findIndex(r => r.id === req.id)
-    if (idx >= 0) {
-      all[idx].status = 'accepted'
-      saveRequests(all)
+    const ac = new AbortController(); const to = setTimeout(()=>ac.abort(), 10000)
+    try {
+      await postJSON(API.approve(req.id), undefined, ac.signal)
+      showToast('已同意綁定')
+    } catch {
+      // 後備：localStorage
+      const all = loadRequestsLS()
+      const idx = all.findIndex(r => r.id === req.id)
+      if (idx >= 0) { all[idx].status = 'accepted'; saveRequestsLS(all) }
+      const list = loadLinkedLS(email)
+      list.push({ childEmail: req.childEmail, childName: req.childName, linkedAt: Date.now() })
+      saveLinkedLS(email, list)
+      showToast('已同意（本機）')
+    } finally {
+      clearTimeout(to)
+      setPicked(null)
+      void refreshAll()
     }
-    // 2) 寫入已綁定名單
-    const list = loadLinked(email)
-    list.push({ childEmail: req.childEmail, childName: req.childName, linkedAt: Date.now() })
-    saveLinked(email, list)
-    // 3) 刷新畫面
-    setRequests(prev => prev.filter(r => r.id !== req.id))
-    setLinked(loadLinked(email).sort((a,b)=>b.linkedAt - a.linkedAt))
-    setPicked(null)
-    showToast('已同意綁定')
   }
 
-  function reject(req: LinkRequest){
-    const all = loadRequests()
-    const idx = all.findIndex(r => r.id === req.id)
-    if (idx >= 0) {
-      all[idx].status = 'rejected'
-      saveRequests(all)
+  async function reject(req: LinkRequest){
+    const ac = new AbortController(); const to = setTimeout(()=>ac.abort(), 10000)
+    try {
+      await postJSON(API.reject(req.id), undefined, ac.signal)
+      showToast('已拒絕綁定')
+    } catch {
+      // 後備：localStorage
+      const all = loadRequestsLS()
+      const idx = all.findIndex(r => r.id === req.id)
+      if (idx >= 0) { all[idx].status = 'rejected'; saveRequestsLS(all) }
+      showToast('已拒絕（本機）')
+    } finally {
+      clearTimeout(to)
+      setPicked(null)
+      void refreshAll()
     }
-    setRequests(prev => prev.filter(r => r.id !== req.id))
-    setPicked(null)
-    showToast('已拒絕綁定')
   }
 
-  // 測試：快速新增一筆 pending（等你有子女端頁面就不需要這顆）
+  // 測試：快速新增一筆 pending（有真正子女端就可刪除）
   function addDemoRequest(){
     if (!currentUser?.email) return
     const req = submitLinkRequestMock({
@@ -141,7 +223,7 @@ export default function LinkChild(){
       note: '請求查看日記',
     })
     setRequests(prev => [req, ...prev])
-    showToast('已新增一筆測試請求')
+    showToast('已新增一筆測試請求（本機）')
   }
 
   if (!currentUser?.email) {
@@ -162,6 +244,8 @@ export default function LinkChild(){
           子女需要在「子女端 App」輸入你的 Email（{currentUser.email}）送出綁定請求。
           你在這裡可以同意或拒絕。支援從訊息點擊連結 <code>?rid=…</code> 直接打開審核視窗。
         </div>
+        {loading && <div className="meta" style={{marginTop:6}}>讀取中…</div>}
+        {err && <div className="meta" style={{marginTop:6, color:'#b91c1c'}}>提示：{err}</div>}
       </div>
 
       {/* 待審核請求清單 */}
@@ -253,4 +337,3 @@ export default function LinkChild(){
     </div>
   )
 }
-

@@ -7,6 +7,21 @@ import { createPortal } from 'react-dom'
 
 dayjs.locale('zh-tw')
 
+// ================= 可調整區（後端位址 / API 路徑） =================
+const BASE_URL =
+  (import.meta as any)?.env?.VITE_API_BASE_URL ||
+  `${window.location.protocol}//${window.location.hostname}:8000`
+/**
+ * 後端「月份摘要」端點：
+ * 預期：GET /diary/summary?month=YYYY-MM  （若你們用 child 專屬路徑，改成 /child/diary/summary）
+ * 回傳格式任一皆可，會容錯：
+ * {
+ *   "2025-09-01": { count: 2, hasAudio: true, hasImage: false, hasVideo: true }
+ * }
+ */
+const API_MONTH_SUMMARY = '/diary/summary'
+
+// ================= 型別 =================
 function buildMonthGrid(base: dayjs.Dayjs){
   const start = base.startOf('month').startOf('week')
   return Array.from({length:42}, (_,i)=>start.add(i,'day'))
@@ -45,10 +60,77 @@ function getHostRect(anchor?: HTMLElement | null): DOMRect {
   return (el || document.body).getBoundingClientRect()
 }
 
+// ======= 後端：月份摘要 =======
+type DaySummary = { count?: number; hasAudio?: boolean; hasImage?: boolean; hasVideo?: boolean }
+type MonthSummary = Record<string, DaySummary> // key: YYYY-MM-DD
+
+function buildAuthHeaders(): Headers {
+  const h = new Headers({ Accept: 'application/json' })
+  try {
+    const t = localStorage.getItem('token')
+    if (t) h.set('Authorization', `Bearer ${t}`)
+  } catch {}
+  return h
+}
+
+async function fetchMonthSummary(m: string, signal?: AbortSignal): Promise<MonthSummary> {
+  const ctrl = new AbortController()
+  const timer = setTimeout(() => ctrl.abort(), 10000)
+  try {
+    const res = await fetch(
+      `${BASE_URL}${API_MONTH_SUMMARY}?month=${encodeURIComponent(m)}`,
+      {
+        headers: buildAuthHeaders(),
+        signal: signal ?? ctrl.signal,
+        credentials: 'include', // 若用 cookie-session
+      }
+    )
+    let data: any = null; try { data = await res.json() } catch {}
+    if (!res.ok) throw new Error(data?.detail || data?.message || `HTTP ${res.status}`)
+
+    // 容錯轉換
+    const map: MonthSummary = {}
+    if (data && typeof data === 'object') {
+      for (const [k, v] of Object.entries<any>(data)) {
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(k)) continue
+        map[k] = {
+          count: typeof v?.count === 'number' ? v.count : undefined,
+          hasAudio: !!v?.hasAudio || !!v?.audio,
+          hasImage: !!v?.hasImage || !!v?.image,
+          hasVideo: !!v?.hasVideo || !!v?.video,
+        }
+      }
+    }
+    return map
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
 export default function CalendarPage(){
   const [focus,setFocus]=useState(dayjs())
   const cells = useMemo(()=>buildMonthGrid(focus),[focus])
   const nav = useNavigate()
+
+  // ====== 月份摘要狀態（快取每個月） ======
+  const [loading, setLoading] = useState(false)
+  const [loadErr, setLoadErr] = useState<string | null>(null)
+  const [summary, setSummary] = useState<MonthSummary>({})
+  const cacheRef = useRef<Record<string, MonthSummary>>({}) // key: YYYY-MM
+
+  // 載入目前月份的摘要
+  useEffect(() => {
+    const month = focus.format('YYYY-MM')
+    // 快取命中
+    if (cacheRef.current[month]) { setSummary(cacheRef.current[month]); return }
+    const ac = new AbortController()
+    setLoading(true); setLoadErr(null); setSummary({})
+    fetchMonthSummary(month, ac.signal)
+      .then((map) => { cacheRef.current[month] = map; setSummary(map) })
+      .catch((e:any) => setLoadErr(e?.message || '讀取失敗'))
+      .finally(() => setLoading(false))
+    return () => ac.abort()
+  }, [focus.year(), focus.month()]) // 切換月份時觸發
 
   // ===== Spotlight 導覽 refs/states =====
   const headerRef = useRef<HTMLDivElement | null>(null)     // 頁面抬頭（日期/星期）
@@ -179,21 +261,55 @@ export default function CalendarPage(){
           <div>{focus.format('YYYY年M月')}</div>
           <button onClick={()=>setFocus(focus.add(1,'month'))}>›</button>
         </div>
+
+        {/* 錯誤提示（可重試） */}
+        {loadErr && (
+          <div className="inline-alert" role="alert" style={{marginTop:8}}>
+            <div className="inline-alert-text">{loadErr}</div>
+            <button
+              className="inline-alert-close"
+              aria-label="重試"
+              onClick={() => {
+                // 重新觸發當月載入
+                setFocus(dayjs(focus)) // 觸發 useEffect
+              }}
+            >↻</button>
+          </div>
+        )}
+
         <div className="cal-week">
           {'週日 週一 週二 週三 週四 週五 週六'.split(' ').map(w=><div key={w} style={{textAlign:'center'}}>{w}</div>)}
         </div>
-        <div ref={calGridRef} className="cal-grid">
+
+        <div ref={calGridRef} className={`cal-grid ${loading ? 'loading' : ''}`} aria-busy={loading}>
           {cells.map(d=>{
             const inMonth = d.month()===focus.month()
             const isToday = d.isSame(dayjs(), 'day')
+            const key = d.format('YYYY-MM-DD')
+            const sum = summary[key]
+            const hasAny = !!sum && (sum.count || sum.hasAudio || sum.hasImage || sum.hasVideo)
+
             return (
               <div
-                key={d.format('YYYY-MM-DD')}
+                key={key}
                 className={`cal-cell ${inMonth?'':'out'} ${isToday?'today':''}`}
-                onClick={() => nav(`/child/diary2/${d.format('YYYY-MM-DD')}`)}
+                onClick={() => nav(`/child/diary2/${key}`)}
                 title={`查看 ${d.format('YYYY/MM/DD')} 的日記`}
+                style={{ position:'relative' }}
               >
                 {d.date()}
+                {/* 右下角小圓點（有資料才顯示） */}
+                {hasAny && (
+                  <span
+                    aria-hidden
+                    style={{
+                      position:'absolute',
+                      right:6, bottom:6,
+                      width:6, height:6, borderRadius:'50%',
+                      background:'#333', opacity:.9
+                    }}
+                  />
+                )}
               </div>
             )
           })}
