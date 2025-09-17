@@ -3,7 +3,7 @@ import { useNavigate, useLocation, Link } from 'react-router-dom'
 
 // =============== 可調整區：後端位址與 API Path ==================
 const BASE_URL = (import.meta as any)?.env?.VITE_API_BASE_URL || 'http://127.0.0.1:8000'
-const API_LOGIN = '/enroll/login'
+const API_LOGIN = '/auth/login'
 
 // 後端回傳格式（可依你們實際回傳調整）
 type LoginResponse = {
